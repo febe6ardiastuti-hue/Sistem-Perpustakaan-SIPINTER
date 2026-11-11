@@ -1,11 +1,16 @@
 """app.py — SIPINTER (Sistem Informasi Peminjaman Interaktif dan Nyaman Terpadu)."""
 import base64
+import json
+import logging
+import os
 import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 import database as db
 
 # ================= KONFIG =================
@@ -31,7 +36,8 @@ st.markdown("""
 .sidebar-logo { text-align: center; padding: 20px 0 30px 0; }
 .sidebar-logo h2 { margin: 0; color: #1e3a8a; font-size: 24px; font-weight: 800; letter-spacing: 2px; }
 
-div.stButton > button[kind="primary"] { background-color: #1e3a8a; color: white; border-radius: 8px; font-weight: bold; }
+div.stButton > button[kind="primary"] { background: #365a7a; color: white; border: 1px solid #365a7a; border-radius: 8px; font-weight: 600; }
+div.stButton > button[kind="primary"]:hover { background: #2d4d69; border-color: #2d4d69; color: white; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,17 +68,85 @@ def badge(s):
     c, teks = cfg.get(s, ("#0d6efd", s))
     return (f'<span style="background:{c};color:#fff;padding:4px 12px;border-radius:12px;font-size:12px;font-weight:600">{teks}</span>')
 
-def link_wa(no, pesan): return f"https://wa.me/{no}?text={quote(pesan)}"
+def kirim_whatsapp(no, pesan):
+    token = os.getenv("WHATSAPP_ACCESS_TOKEN")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    api_version = os.getenv("WHATSAPP_API_VERSION", "v22.0")
+    if not token or not phone_number_id:
+        return False, (
+            "WhatsApp belum dikonfigurasi. Atur WHATSAPP_ACCESS_TOKEN dan "
+            "WHATSAPP_PHONE_NUMBER_ID pada environment aplikasi."
+        )
 
-def catat_log(id_trx, jenis, no, pesan):
+    payload = json.dumps({
+        "messaging_product": "whatsapp",
+        "to": no,
+        "type": "text",
+        "text": {"body": pesan},
+    }).encode("utf-8")
+    request = Request(
+        f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=20) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except json.JSONDecodeError:
+            pass
+        return False, f"WhatsApp API menolak pesan: {detail}"
+    except URLError as error:
+        return False, f"Tidak dapat menghubungi WhatsApp API: {error.reason}"
+    except json.JSONDecodeError:
+        return False, "Respons WhatsApp API tidak dapat dibaca."
+
+    if not isinstance(response_data, dict):
+        return False, "Respons WhatsApp API memiliki format yang tidak valid."
+    if not response_data.get("messages"):
+        return False, "WhatsApp API tidak mengonfirmasi pengiriman pesan."
+    return True, "Pesan WhatsApp berhasil dikirim."
+
+def url_whatsapp(no, pesan):
+    nomor = "".join(filter(str.isdigit, str(no)))
+    if not nomor:
+        return None
+    return f"https://wa.me/{nomor}?text={quote(pesan, safe='')}"
+
+def catat_log(id_trx, jenis, no, pesan, status):
     db.x("""INSERT INTO log_whatsapp (id_transaksi,jenis,no_tujuan,isi_pesan,status,waktu_kirim)
-            VALUES (?,?,?,?,?,?)""", (id_trx, jenis, no, pesan, "TERKIRIM", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            VALUES (?,?,?,?,?,?)""", (id_trx, jenis, no, pesan, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+def kirim_dan_catat_whatsapp(id_trx, jenis, no, pesan):
+    berhasil, hasil = kirim_whatsapp(no, pesan)
+    status = "TERKIRIM" if berhasil else f"GAGAL: {hasil}"
+    catat_log(id_trx, jenis, no, pesan, status)
+    if not berhasil:
+        logging.warning(
+            "WhatsApp delivery failed for transaction %s (%s): %s",
+            id_trx,
+            jenis,
+            hasil,
+        )
+    return berhasil, hasil
 
 def flash(msg, tipe="success"): st.session_state["flash"] = (tipe, msg)
 def tampil_flash():
     if st.session_state["flash"]:
         tipe, msg = st.session_state["flash"]; st.session_state["flash"] = None
-        (st.success if tipe == "success" else st.error)(msg)
+        notifier = {
+            "success": st.success,
+            "warning": st.warning,
+            "error": st.error,
+        }.get(tipe, st.info)
+        notifier(msg)
 
 def buka_detail_trx(i): st.session_state.update(detail_trx=i, detail_pem=None, detail_buk=None)
 def buka_detail_pem(i): st.session_state.update(detail_pem=i, detail_trx=None, detail_buk=None)
@@ -86,13 +160,26 @@ def ambil_transaksi_lengkap(id_trx):
 
 # ================= TEMPLATE WA =================
 def wa_sukses_pinjam(t, p, b, tgl_tenggat):
-    return f"""Yth. {p['nama']},\n\nKami informasikan bahwa proses peminjaman buku di SIPINTER telah berhasil dicatat dalam sistem.\n\n*Informasi Peminjam*\nNama Lengkap: {p['nama']}\nNIM: {p['nim']}\nJurusan: {p['jurusan']}\nProgram Studi: {p['program_studi']}\nKelas: {p['kelas']}\n\n*Informasi Pengembalian dan Denda*\nMohon mengembalikan buku paling lambat pada tanggal {tgl_tenggat}. Apabila terjadi keterlambatan pengembalian, peminjam akan dikenakan denda sebesar Rp1.000 per hari. \n\nHormat kami,\nAdministrasi SIPINTER"""
+    return f"""Yth. {p['nama']},\n\nPeminjaman buku Anda berhasil dicatat.\n\n*Bukti Transaksi*\nKode transaksi: {t['kode_transaksi']}\nNama peminjam: {p['nama']}\nNIM: {p['nim']}\nBuku: {b['judul']}\nTanggal pinjam: {tgl(t['tanggal_pinjam'])}\nBatas pengembalian: {tgl_tenggat}\n\nSilakan simpan kode transaksi ini sebagai bukti peminjaman.\n\nAdministrasi SIPINTER"""
+
+def wa_sukses_kembali(t, p, b, denda):
+    return f"""Yth. {p['nama']},\n\nPengembalian buku Anda berhasil dicatat.\n\n*Bukti Transaksi*\nKode transaksi: {t['kode_transaksi']}\nNama peminjam: {p['nama']}\nBuku: {b['judul']}\nTanggal kembali: {tgl(t['tanggal_kembali'])}\nDenda: {rp(denda)} (lunas)\n\nTerima kasih telah menggunakan layanan SIPINTER."""
 
 def wa_terlambat(t, p, b, hari, denda):
     return f"""Yth. {p['nama']},\n\nBerdasarkan catatan sistem, peminjaman buku Anda telah melewati batas waktu.\n\n*Buku:* {b['judul']}\n*Batas Kembali:* {tgl(t['tanggal_tenggat'])}\n*Keterlambatan:* {hari} hari\n*Total Denda:* Rp{denda:,}\n\nMohon segera kembalikan buku. Terima kasih.\n\nAdministrasi SIPINTER""".replace(",", ".")
 
 # ================= SIDEBAR =================
 def render_sidebar():
+    nav_icons = {
+        "Peminjaman": ":material/bookmark_add:",
+        "Pengembalian": ":material/assignment_return:",
+        "Transaksi": ":material/receipt_long:",
+        "Denda": ":material/payments:",
+        "Buku": ":material/menu_book:",
+        "Anggota": ":material/group:",
+        "Penulis": ":material/edit_note:",
+        "Penerbit": ":material/business:",
+    }
     with st.sidebar:
         _, logo_center, _ = st.columns([1, 2, 1])
         with logo_center:
@@ -101,7 +188,10 @@ def render_sidebar():
         
         aktif = "menu-active" if st.session_state["halaman"] == "Dashboard" else ""
         st.markdown(f'<div class="{aktif}">', unsafe_allow_html=True)
-        if st.button("Dashboard", key="nav_dash", use_container_width=True):
+        if st.button(
+            "Dashboard", key="nav_dash", icon=":material/dashboard:",
+            type="primary" if aktif else "secondary", use_container_width=True,
+        ):
             st.session_state.update(halaman="Dashboard", mode_tambah=False); tutup_detail(); st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -109,7 +199,10 @@ def render_sidebar():
         for nama in ["Peminjaman", "Pengembalian"]:
             aktif = "menu-active" if st.session_state["halaman"] == nama else ""
             st.markdown(f'<div class="{aktif}">', unsafe_allow_html=True)
-            if st.button(nama, key=f"nav_{nama}", use_container_width=True):
+            if st.button(
+                nama, key=f"nav_{nama}", icon=nav_icons[nama],
+                type="primary" if aktif else "secondary", use_container_width=True,
+            ):
                 st.session_state.update(halaman=nama, mode_tambah=False); tutup_detail(); st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -117,7 +210,10 @@ def render_sidebar():
         for nama in ["Transaksi", "Denda"]:
             aktif = "menu-active" if st.session_state["halaman"] == nama else ""
             st.markdown(f'<div class="{aktif}">', unsafe_allow_html=True)
-            if st.button(nama, key=f"nav_{nama}", use_container_width=True):
+            if st.button(
+                nama, key=f"nav_{nama}", icon=nav_icons[nama],
+                type="primary" if aktif else "secondary", use_container_width=True,
+            ):
                 st.session_state.update(halaman=nama, mode_tambah=False); tutup_detail(); st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -125,7 +221,10 @@ def render_sidebar():
         for nama in ["Buku", "Anggota", "Penulis", "Penerbit"]:
             aktif = "menu-active" if st.session_state["halaman"] == nama else ""
             st.markdown(f'<div class="{aktif}">', unsafe_allow_html=True)
-            if st.button(nama, key=f"nav_{nama}", use_container_width=True):
+            if st.button(
+                nama, key=f"nav_{nama}", icon=nav_icons[nama],
+                type="primary" if aktif else "secondary", use_container_width=True,
+            ):
                 st.session_state.update(halaman=nama, mode_tambah=False); tutup_detail(); st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -214,37 +313,56 @@ def halaman_dashboard():
         pesan = wa_terlambat(t, p, b, hari, denda) if t["status"] == "TERLAMBAT" else wa_sukses_pinjam(t, p, b, tgl(t["tanggal_tenggat"]))
         
         c1, c2, c3, c4, c5, c6 = st.columns([1.5, 2.5, 2.5, 2.5, 2, 1])
-        if c1.button(t["kode_transaksi"], key=f"d_kode_{t['id']}", use_container_width=True):
+        if c1.button(t["kode_transaksi"], key=f"d_kode_{t['id']}", icon=":material/visibility:", use_container_width=True):
             buka_detail_trx(t["id"]); st.rerun()
         c2.write(t["nama_peminjam"])
         c3.write(t["kategori"])
         c4.write(tgl(t["tanggal_tenggat"]))
         c5.markdown(badge(t["status"]), unsafe_allow_html=True)
         with c6:
-            if st.link_button("Kirim WhatsApp", link_wa(t["no_whatsapp"], pesan), help="Kirim Pesan WhatsApp"):
-                catat_log(t["id"], "PENGINGAT", t["no_whatsapp"], pesan)
+            url_wa = url_whatsapp(t["no_whatsapp"], pesan)
+            if url_wa:
+                st.link_button(
+                    "Kirim WhatsApp", url_wa, key=f"wa_dash_{t['id']}",
+                    icon=":material/send:", help="Buka WhatsApp dengan pesan siap dikirim",
+                )
+            else:
+                st.warning("Nomor WhatsApp tidak valid.")
 
 # ================= HALAMAN: TRANSAKSI =================
 def halaman_transaksi():
     st.title("Transaksi")
+
+    cari = st.text_input(
+        "Cari Transaksi",
+        placeholder="Kode transaksi, nama/NIM peminjam, kode/judul buku",
+        key="trx_search",
+    ).strip()
     
-    c1, c2, c3, c4, c5, c6 = st.columns([1.5, 2.5, 2.5, 2.5, 2, 1])
+    c1, c2, c3, c4, c5, c6, c7 = st.columns([1.5, 2, 2.5, 1.8, 2, 1.8, 1.5])
     c1.markdown("**ID Transaksi**")
     c2.markdown("**Nama Peminjam**")
     c2.selectbox("Urut Nama", ["A-Z", "Z-A"], key="trx_sort_nama", label_visibility="collapsed")
     
-    c3.markdown("**Kategori Buku**")
-    c3.selectbox("Kategori", ["Semua"] + list(db.KATEGORI_BUKU.keys()), key="trx_kat_buku", label_visibility="collapsed")
+    c3.markdown("**Judul Buku**")
+    c4.markdown("**Kategori Buku**")
+    c4.selectbox("Kategori", ["Semua"] + list(db.KATEGORI_BUKU.keys()), key="trx_kat_buku", label_visibility="collapsed")
     
-    c4.markdown("**Waktu**")
-    c4.selectbox("Urut Waktu", ["Terbaru", "Terlama"], key="trx_sort_waktu", label_visibility="collapsed")
+    c5.markdown("**Waktu**")
+    c5.selectbox("Urut Waktu", ["Terbaru", "Terlama"], key="trx_sort_waktu", label_visibility="collapsed")
     
-    c5.markdown("**Status**")
-    f_status = c5.selectbox("Filter Status", ["Semua", "DIPINJAM", "TERLAMBAT", "DIKEMBALIKAN"], key="trx_filter_status", label_visibility="collapsed")
-    c6.markdown("**Aksi**")
+    c6.markdown("**Status**")
+    f_status = c6.selectbox("Filter Status", ["Semua", "DIPINJAM", "TERLAMBAT", "DIKEMBALIKAN"], key="trx_filter_status", label_visibility="collapsed")
+    c7.markdown("**Aksi**")
 
     sql = """SELECT t.*, p.nama AS nama_peminjam, b.kode_buku, b.judul, b.kategori FROM transaksi t 
              JOIN peminjam p ON p.id=t.id_peminjam JOIN buku b ON b.id=t.id_buku WHERE 1=1"""
+    params = []
+
+    if cari:
+        sql += """ AND (t.kode_transaksi LIKE ? OR p.nama LIKE ? OR p.nim LIKE ?
+                  OR b.kode_buku LIKE ? OR b.judul LIKE ?)"""
+        params.extend([f"%{cari}%"] * 5)
              
     if f_status != "Semua": sql += f" AND t.status = '{f_status}'"
     if st.session_state["trx_kat_buku"] != "Semua": sql += f" AND b.kategori = '{st.session_state['trx_kat_buku']}'"
@@ -255,29 +373,38 @@ def halaman_transaksi():
     if st.session_state["trx_sort_waktu"] == "Terbaru": sql += ", t.id DESC"
     else: sql += ", t.id ASC"
         
-    data = db.q(sql)
-    if not data: st.info("Belum ada data."); return
+    data = db.q(sql, params)
+    if not data:
+        st.info("Tidak ada transaksi yang cocok dengan pencarian atau filter.")
+        return
 
     for t in data:
         hari, denda = db.hitung_denda(t)
-        c1, c2, c3, c4, c5, c6 = st.columns([1.5, 2.5, 2.5, 2.5, 2, 1])
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([1.5, 2, 2.5, 1.8, 2, 1.8, 1.5])
         
-        if c1.button(t["kode_transaksi"], key=f"tbl_id_{t['id']}", use_container_width=True):
+        if c1.button(t["kode_transaksi"], key=f"tbl_id_{t['id']}", icon=":material/visibility:", use_container_width=True):
             buka_detail_trx(t["id"]); st.rerun()
         c2.write(t["nama_peminjam"])
-        c3.write(t["kategori"])
+        c3.write(t["judul"])
+        c4.write(t["kategori"])
         
         info_waktu = f"Pinjam: {tgl(t['tanggal_pinjam'])}<br>Tenggat: {tgl(t['tanggal_tenggat'])}"
-        c4.markdown(f"<span style='font-size:12px'>{info_waktu}</span>", unsafe_allow_html=True)
-        c5.markdown(badge(t["status"]), unsafe_allow_html=True)
-        
-        with c6:
+        c5.markdown(f"<span style='font-size:12px'>{info_waktu}</span>", unsafe_allow_html=True)
+        c6.markdown(badge(t["status"]), unsafe_allow_html=True)
+
+        with c7:
             if t["status"] == "TERLAMBAT":
                 p = db.q("SELECT * FROM peminjam WHERE id=?", (t["id_peminjam"],))[0]
                 b = db.q("SELECT * FROM buku WHERE id=?", (t["id_buku"],))[0]
                 pesan_wa = wa_terlambat(t, p, b, hari, denda)
-                if st.link_button("Kirim WhatsApp", link_wa(p["no_whatsapp"], pesan_wa), use_container_width=True):
-                    catat_log(t["id"], "TERLAMBAT", p["no_whatsapp"], pesan_wa)
+                url_wa = url_whatsapp(p["no_whatsapp"], pesan_wa)
+                if url_wa:
+                    st.link_button(
+                        "Kirim WhatsApp", url_wa, key=f"wa_trx_{t['id']}",
+                        icon=":material/send:", use_container_width=True,
+                    )
+                else:
+                    st.warning("Nomor WhatsApp tidak valid.")
             else:
                 st.write("-")
 
@@ -299,6 +426,31 @@ def halaman_peminjaman():
     boleh, alasan = db.cek_boleh_pinjam(pem["id"])
     if not boleh: 
         st.warning(alasan)
+        transaksi_aktif = db.q(
+            """SELECT t.id, t.kode_transaksi, t.status, t.tanggal_pinjam,
+                      t.tanggal_tenggat, b.judul
+               FROM transaksi t JOIN buku b ON b.id=t.id_buku
+               WHERE t.id_peminjam=? AND t.status IN ('DIPINJAM','TERLAMBAT')
+               ORDER BY t.id DESC""",
+            (pem["id"],),
+        )
+        if transaksi_aktif:
+            st.subheader("Transaksi yang belum selesai")
+            for transaksi in transaksi_aktif:
+                c1, c2 = st.columns([4, 1])
+                c1.write(
+                    f"**{transaksi['kode_transaksi']}** — {transaksi['judul']} | "
+                    f"Pinjam {tgl(transaksi['tanggal_pinjam'])} | "
+                    f"Tenggat {tgl(transaksi['tanggal_tenggat'])}"
+                )
+                c2.markdown(badge(transaksi["status"]), unsafe_allow_html=True)
+                if st.button(
+                    "Lihat detail dan bukti transaksi",
+                    key=f"pinjam_detail_aktif_{transaksi['id']}",
+                    icon=":material/receipt_long:",
+                ):
+                    buka_detail_trx(transaksi["id"])
+                    st.rerun()
         return
         
     st.success(f"Data ditemukan: **{pem['nama']}** | {pem['program_studi']} | Kelas {pem['kelas']}")
@@ -330,31 +482,25 @@ def halaman_peminjaman():
     setting = db.pengaturan()
     hari_ini = date.today()
     tenggat = hari_ini + timedelta(days=setting["lama_pinjam"])
-    st.info(f"Tanggal Pinjam: **{tgl(hari_ini)}** | Batas Pengembalian: **{tgl(tenggat)}** (7 Hari)")
+    st.info(f"Tanggal Pinjam: **{tgl(hari_ini)}** | Batas Pengembalian: **{tgl(tenggat)}** ({setting['lama_pinjam']} Hari)")
     
-    if st.button("Proses Peminjaman", type="primary"):
-        if no_wa_final != pem["no_whatsapp"]:
-            db.x("UPDATE peminjam SET no_whatsapp=? WHERE id=?", (no_wa_final, pem["id"]))
+    if st.button("Proses Peminjaman", type="primary", icon=":material/bookmark_add:"):
+        try:
+            id_trx, kode, tenggat = db.proses_peminjaman(
+                pem["id"], buk["id"], no_wa_final, hari_ini
+            )
+        except (ValueError, sqlite3.Error) as error:
+            st.error(f"Peminjaman gagal diproses: {error}")
+        else:
             pem["no_whatsapp"] = no_wa_final
-            
-        kode = db.kode_transaksi_baru()
-        id_trx = db.x("""INSERT INTO transaksi (kode_transaksi,id_peminjam,id_buku,
-                tanggal_pinjam,tanggal_tenggat,status) VALUES (?,?,?,?,?,?)""",
-             (kode, pem["id"], buk["id"], str(hari_ini), str(tenggat), "DIPINJAM"))
-        db.x("UPDATE buku SET stok_tersedia=stok_tersedia-1 WHERE id=?", (buk["id"],))
-        
-        pesan = wa_sukses_pinjam({"tanggal_tenggat": str(tenggat)}, pem, buk, tgl(tenggat))
-        catat_log(id_trx, "BUKTI", pem["no_whatsapp"], pesan)
-        
-        st.success(f"Peminjaman {kode} berhasil diproses.")
-        st.session_state["wa_link_baru"] = link_wa(pem["no_whatsapp"], pesan)
-        st.rerun()
-
-    if "wa_link_baru" in st.session_state:
-        st.info("Silakan kirim bukti peminjaman ke WhatsApp mahasiswa:")
-        st.link_button("Buka WhatsApp", st.session_state["wa_link_baru"], type="primary")
-        if st.button("Tutup"):
-            del st.session_state["wa_link_baru"]; st.rerun()
+            transaksi = ambil_transaksi_lengkap(id_trx)
+            pesan = wa_sukses_pinjam(
+                transaksi, pem, buk, tgl(tenggat)
+            )
+            kirim_dan_catat_whatsapp(id_trx, "BUKTI", pem["no_whatsapp"], pesan)
+            flash(f"Peminjaman {kode} berhasil diproses. Detail dan bukti transaksi tersedia.")
+            buka_detail_trx(id_trx)
+            st.rerun()
 
 # ================= HALAMAN: PENGEMBALIAN =================
 def halaman_pengembalian():
@@ -386,13 +532,27 @@ def halaman_pengembalian():
             else: 
                 st.success("Tidak ada denda.")
 
-            if st.button("Proses Pengembalian & Lunas Denda", key=f"kembali_{t['id']}", type="primary"):
-                today = date.today()
-                db.x("""UPDATE transaksi SET tanggal_kembali=?, hari_terlambat=?, total_denda=?,
-                        denda_lunas=1, status='DIKEMBALIKAN' WHERE id=?""", (str(today), hari, denda, t["id"]))
-                db.x("UPDATE buku SET stok_tersedia=stok_tersedia+1 WHERE id=?", (t["id_buku"],))
-                st.success("Buku berhasil dikembalikan. Denda tercatat lunas.")
-                st.rerun()
+            if st.button("Proses Pengembalian & Lunas Denda", key=f"kembali_{t['id']}", type="primary", icon=":material/assignment_return:"):
+                try:
+                    hari, denda = db.proses_pengembalian(t["id"], date.today())
+                except (ValueError, sqlite3.Error) as error:
+                    st.error(f"Pengembalian gagal diproses: {error}")
+                else:
+                    transaksi = ambil_transaksi_lengkap(t["id"])
+                    peminjam = {
+                        "nama": transaksi["nama_peminjam"],
+                    }
+                    buku = {"judul": transaksi["judul"]}
+                    pesan = wa_sukses_kembali(transaksi, peminjam, buku, denda)
+                    kirim_dan_catat_whatsapp(
+                        t["id"], "PENGEMBALIAN", transaksi["no_whatsapp"], pesan
+                    )
+                    flash(
+                        f"Pengembalian {transaksi['kode_transaksi']} berhasil. "
+                        "Stok buku dipulihkan dan detail transaksi tersedia."
+                    )
+                    buka_detail_trx(t["id"])
+                    st.rerun()
 
 # ================= HALAMAN: DENDA =================
 def halaman_denda():
@@ -402,44 +562,75 @@ def halaman_denda():
     c1.markdown("**Nama Peminjam**")
     c1.selectbox("Urut Nama", ["A-Z", "Z-A"], key="denda_sort_nama", label_visibility="collapsed")
     c2.markdown("**Status Denda**")
-    f_denda = c2.selectbox("Status Denda", ["Semua", "Lunas", "Belum Bayar"], key="denda_filter", label_visibility="collapsed")
+    c2.markdown("Lunas")
     c3.markdown("**Total**")
 
-    sql = """SELECT t.*, p.nama AS nama_peminjam, b.judul, b.kode_buku FROM transaksi t 
-             JOIN peminjam p ON p.id=t.id_peminjam JOIN buku b ON b.id=t.id_buku WHERE t.total_denda > 0"""
-             
-    if f_denda == "Lunas": sql += " AND t.denda_lunas = 1"
-    elif f_denda == "Belum Bayar": sql += " AND t.denda_lunas = 0"
-    
-    if st.session_state["denda_sort_nama"] == "A-Z": sql += " ORDER BY p.nama ASC"
-    else: sql += " ORDER BY p.nama DESC"
-    
-    rows = db.q(sql)
-    if not rows: 
+    urutan = "ASC" if st.session_state["denda_sort_nama"] == "A-Z" else "DESC"
+    rows = db.q(
+        """SELECT t.*, p.nama AS nama_peminjam, b.judul, b.kode_buku
+           FROM transaksi t
+           JOIN peminjam p ON p.id=t.id_peminjam
+           JOIN buku b ON b.id=t.id_buku
+           WHERE t.status='DIKEMBALIKAN' AND t.denda_lunas=1 AND t.total_denda>0
+           ORDER BY p.nama """ + urutan + ", t.id DESC"
+    )
+    denda_rows = []
+    for transaksi in rows:
+        hari, total = db.hitung_denda(transaksi)
+        if total <= 0:
+            continue
+        transaksi["hari_denda"] = hari
+        transaksi["jumlah_denda"] = total
+        denda_rows.append(transaksi)
+
+    if not denda_rows:
         st.success("Tidak ada catatan denda.")
         return
-        
-    for t in rows:
-        status_lunas = "LUNAS" if t["denda_lunas"] else "BELUM DIBAYAR"
-        with st.expander(f"{t['nama_peminjam']} — {rp(t['total_denda'])} ({status_lunas})"):
+
+    st.metric("Total Denda Lunas", rp(sum(t["jumlah_denda"] for t in denda_rows)))
+    for t in denda_rows:
+        nama, status, total = st.columns([4, 4, 2])
+        nama.write(t["nama_peminjam"])
+        status.write("LUNAS")
+        total.write(rp(t["jumlah_denda"]))
+        with st.expander(f"Detail denda — {t['kode_transaksi']}"):
             st.write(f"**Buku:** {t['judul']} ({t['kode_buku']})")
-            st.write(f"**Keterlambatan:** {t['hari_terlambat']} hari")
+            st.write(f"**Keterlambatan:** {t['hari_denda']} hari")
+            st.write(f"**Total denda:** {rp(t['jumlah_denda'])}")
 
 # ================= HALAMAN: MASTER DATA =================
 def halaman_master_buku():
     st.title("Data Buku")
     
-    if st.button("Tambah Buku", type="primary"):
+    if st.button("Tambah Buku", type="primary", icon=":material/add:"):
         st.session_state["mode_edit_buku"] = None
         st.session_state["mode_tambah"] = "buku"
         
     if st.session_state.get("mode_tambah") == "buku":
+        kategori_buku = list(db.KATEGORI_BUKU)
+        st.session_state.setdefault("buku_kategori_baru", kategori_buku[0])
+        st.write("**Pilih Kategori Buku**")
+        kategori_cols = st.columns(4)
+        for index, kategori in enumerate(kategori_buku):
+            if kategori_cols[index % 4].button(
+                kategori,
+                key=f"pilih_kategori_buku_{index}",
+                type=(
+                    "primary"
+                    if st.session_state["buku_kategori_baru"] == kategori
+                    else "secondary"
+                ),
+                use_container_width=True,
+            ):
+                st.session_state["buku_kategori_baru"] = kategori
+        kat = st.session_state["buku_kategori_baru"]
+        st.caption(f"Kode buku berikutnya: {db.generate_kode_buku(kat)}")
+
         with st.form("form_tambah_buku"):
             st.subheader("Form Tambah Buku")
             c1, c2 = st.columns(2)
             judul = c1.text_input("Judul Buku", placeholder="Cth: Belajar Python")
             isbn = c2.text_input("ISBN", placeholder="Cth: 978602...")
-            kat = c1.selectbox("Kategori Buku", list(db.KATEGORI_BUKU.keys()))
             tahun = c2.number_input("Tahun Terbit", 1900, 2100, 2024)
             
             penulis_all = db.q("SELECT * FROM penulis ORDER BY nama_penulis")
@@ -450,7 +641,7 @@ def halaman_master_buku():
             
             stok = st.number_input("Total Stok", 1, 1000, 1)
             
-            if st.form_submit_button("Simpan Buku"):
+            if st.form_submit_button("Simpan Buku", icon=":material/save:"):
                 if not judul or not isbn:
                     st.error("Judul dan ISBN wajib diisi.")
                 else:
@@ -463,7 +654,7 @@ def halaman_master_buku():
                         st.rerun()
                     except Exception as e:
                         st.error(f"Gagal menambahkan buku: {e}")
-        if st.button("Batal"):
+        if st.button("Batal", icon=":material/close:"):
             st.session_state["mode_tambah"] = False; st.rerun()
         st.markdown("---")
 
@@ -489,7 +680,7 @@ def halaman_master_buku():
                     index=list(db.KATEGORI_BUKU.keys()).index(buku_edit["kategori"]),
                 )
                 tahun_edit = c2.number_input(
-                    "Tahun Terbit", 1900, 2100, int(buku_edit["tahun_terbit"]),
+                    "Tahun Terbit", 0, 2100, int(buku_edit["tahun_terbit"]),
                 )
                 id_penulis_edit = c1.selectbox(
                     "Penulis", penulis_ids,
@@ -502,7 +693,7 @@ def halaman_master_buku():
                     format_func=lambda value: next(p["nama_penerbit"] for p in penerbit_all if p["id"] == value),
                 )
                 stok_edit = st.number_input("Total Stok", 1, 1000, int(buku_edit["stok_total"]))
-                simpan_edit = st.form_submit_button("Lanjutkan")
+                simpan_edit = st.form_submit_button("Lanjutkan", icon=":material/arrow_forward:")
                 if simpan_edit:
                     dipinjam = buku_edit["stok_total"] - buku_edit["stok_tersedia"]
                     if not judul_edit.strip() or not isbn_edit.strip():
@@ -525,7 +716,7 @@ def halaman_master_buku():
                             },
                         }
                         st.rerun()
-            if st.button("Batal Edit", key="batal_edit_buku"):
+            if st.button("Batal Edit", key="batal_edit_buku", icon=":material/close:"):
                 st.session_state["mode_edit_buku"] = None
                 st.rerun()
             st.markdown("---")
@@ -545,7 +736,7 @@ def halaman_master_buku():
         with st.container(border=True):
             st.warning(f"**{judul_konfirmasi}** {pesan_konfirmasi}")
             ya, batal = st.columns(2)
-            if ya.button("Ya, Lanjutkan", key="konfirmasi_buku_ya", type="primary"):
+            if ya.button("Ya, Lanjutkan", key="konfirmasi_buku_ya", type="primary", icon=":material/check:"):
                 if konfirmasi["aksi"] == "edit":
                     data_edit = konfirmasi["data"]
                     try:
@@ -578,7 +769,7 @@ def halaman_master_buku():
                     st.session_state["konfirmasi_buku"] = None
                     flash("Data buku berhasil dihapus.")
                     st.rerun()
-            if batal.button("Batal", key="konfirmasi_buku_batal"):
+            if batal.button("Batal", key="konfirmasi_buku_batal", icon=":material/close:"):
                 st.session_state["konfirmasi_buku"] = None
                 st.rerun()
 
@@ -643,18 +834,18 @@ def halaman_master_buku():
         baris[5].write(f"{b['stok_tersedia']} / {b['stok_total']}")
         with baris[6]:
             edit, hapus = st.columns(2)
-            if edit.button("Edit", key=f"eb_{b['id']}"):
+            if edit.button("Edit", key=f"eb_{b['id']}", icon=":material/edit:"):
                 st.session_state["mode_tambah"] = False
                 st.session_state["mode_edit_buku"] = b["id"]
                 st.rerun()
-            if hapus.button("Hapus", key=f"hb_{b['id']}"):
+            if hapus.button("Hapus", key=f"hb_{b['id']}", icon=":material/delete:"):
                 st.session_state["konfirmasi_buku"] = {"aksi": "hapus", "id": b["id"]}
                 st.rerun()
 
 def halaman_master_anggota():
     st.title("Data Anggota")
     
-    if st.button("➕ Tambah Anggota", type="primary"):
+    if st.button("Tambah Anggota", type="primary", icon=":material/person_add:"):
         st.session_state["mode_edit_peminjam"] = None
         st.session_state["mode_tambah"] = "anggota"
         
@@ -666,14 +857,17 @@ def halaman_master_anggota():
             nama = st.text_input("Nama Lengkap", placeholder="Contoh: Kylie Jenner")
             wa = st.text_input("No WhatsApp (Awali dengan 62)", placeholder="Contoh: 6281234567890")
             
-            jur = st.selectbox("Pilih Jurusan", list(db.DATA_JURUSAN_PRODI_KELAS.keys()))
+            jurusan_options = list(db.DATA_JURUSAN_PRODI_KELAS)
+            jur = st.selectbox("Pilih Jurusan", jurusan_options)
             list_prodi = db.DATA_JURUSAN_PRODI_KELAS[jur]
-            prodi_opt = [p[0] for p in list_prodi]
+            prodi_opt = sorted({prodi for prodi, _ in list_prodi})
             prodi = st.selectbox("Pilih Program Studi", prodi_opt)
-            kelas = next(p[1] for p in list_prodi if p[0] == prodi)
-            st.info(f"Kelas Otomatis: **{kelas}**")
+            kelas_options = sorted({
+                kelas for nama_prodi, kelas in list_prodi if nama_prodi == prodi
+            })
+            kelas = st.selectbox("Pilih Kelas", kelas_options)
             
-            if st.form_submit_button("Simpan Anggota"):
+            if st.form_submit_button("Simpan Anggota", icon=":material/save:"):
                 if not db.validasi_nim(nim):
                     st.error("Format NIM tidak valid. NIM hanya boleh berisi angka.")
                 elif not db.validasi_wa(wa):
@@ -686,7 +880,7 @@ def halaman_master_anggota():
                         st.rerun()
                     except Exception as e: 
                         st.error(f"Gagal menambahkan anggota. NIM mungkin sudah terdaftar: {e}")
-        if st.button("Batal"):
+        if st.button("Batal", icon=":material/close:"):
             st.session_state["mode_tambah"] = False; st.rerun()
         st.markdown("---")
 
@@ -703,29 +897,39 @@ def halaman_master_anggota():
                 c1, c2 = st.columns(2)
                 nim_edit = c1.text_input("NIM (Angka saja)", value=anggota_edit["nim"])
                 nama_edit = c2.text_input("Nama Lengkap", value=anggota_edit["nama"])
-                jurusan_options = list(db.DATA_JURUSAN_PRODI_KELAS.keys())
+                jurusan_options = list(db.DATA_JURUSAN_PRODI_KELAS)
+                if anggota_edit["jurusan"] not in jurusan_options:
+                    jurusan_options.append(anggota_edit["jurusan"])
                 jurusan_edit = st.selectbox(
                     "Pilih Jurusan", jurusan_options,
-                    index=jurusan_options.index(anggota_edit["jurusan"])
-                    if anggota_edit["jurusan"] in jurusan_options else 0,
+                    index=jurusan_options.index(anggota_edit["jurusan"]),
                     key=f"edit_pem_jurusan_{edit_id}",
                 )
-                prodi_options = db.DATA_JURUSAN_PRODI_KELAS[jurusan_edit]
-                prodi_labels = [prodi[0] for prodi in prodi_options]
-                prodi_default = (
-                    prodi_labels.index(anggota_edit["program_studi"])
-                    if anggota_edit["program_studi"] in prodi_labels else 0
-                )
+                prodi_data = db.DATA_JURUSAN_PRODI_KELAS.get(jurusan_edit, [])
+                prodi_labels = sorted({prodi for prodi, _ in prodi_data})
+                if anggota_edit["program_studi"] not in prodi_labels:
+                    prodi_labels.append(anggota_edit["program_studi"])
+                prodi_labels.sort()
                 prodi_edit = st.selectbox(
-                    "Pilih Program Studi", prodi_labels, index=prodi_default,
+                    "Pilih Program Studi", prodi_labels,
+                    index=prodi_labels.index(anggota_edit["program_studi"]),
                     key=f"edit_pem_prodi_{edit_id}",
                 )
-                kelas_edit = next(kelas for prodi, kelas in prodi_options if prodi == prodi_edit)
-                st.info(f"Kelas Otomatis: **{kelas_edit}**")
+                kelas_options = sorted({
+                    kelas for prodi, kelas in prodi_data if prodi == prodi_edit
+                })
+                if anggota_edit["kelas"] not in kelas_options:
+                    kelas_options.append(anggota_edit["kelas"])
+                    kelas_options.sort()
+                kelas_edit = st.selectbox(
+                    "Pilih Kelas", kelas_options,
+                    index=kelas_options.index(anggota_edit["kelas"]),
+                    key=f"edit_pem_kelas_{edit_id}",
+                )
                 wa_edit = st.text_input(
                     "No WhatsApp (Awali dengan 62)", value=anggota_edit["no_whatsapp"],
                 )
-                if st.form_submit_button("Lanjutkan"):
+                if st.form_submit_button("Lanjutkan", icon=":material/arrow_forward:"):
                     if not nim_edit.strip() or (
                         nim_edit.strip() != anggota_edit["nim"]
                         and not db.validasi_nim(nim_edit.strip())
@@ -749,7 +953,7 @@ def halaman_master_anggota():
                             },
                         }
                         st.rerun()
-            if st.button("Batal Edit", key="batal_edit_peminjam"):
+            if st.button("Batal Edit", key="batal_edit_peminjam", icon=":material/close:"):
                 st.session_state["mode_edit_peminjam"] = None
                 st.rerun()
             st.markdown("---")
@@ -765,7 +969,7 @@ def halaman_master_anggota():
         with st.container(border=True):
             st.warning(f"**{judul_konfirmasi}** {pesan_konfirmasi}")
             ya, batal = st.columns(2)
-            if ya.button("Ya, Lanjutkan", key="konfirmasi_peminjam_ya", type="primary"):
+            if ya.button("Ya, Lanjutkan", key="konfirmasi_peminjam_ya", type="primary", icon=":material/check:"):
                 if konfirmasi["aksi"] == "edit":
                     anggota_baru = konfirmasi["data"]
                     try:
@@ -798,7 +1002,7 @@ def halaman_master_anggota():
                     st.session_state["konfirmasi_peminjam"] = None
                     flash("Data anggota berhasil dihapus.")
                     st.rerun()
-            if batal.button("Batal", key="konfirmasi_peminjam_batal"):
+            if batal.button("Batal", key="konfirmasi_peminjam_batal", icon=":material/close:"):
                 st.session_state["konfirmasi_peminjam"] = None
                 st.rerun()
 
@@ -872,30 +1076,30 @@ def halaman_master_anggota():
         baris[2].write(p["jurusan"])
         baris[3].write(p["program_studi"])
         baris[4].write(p["kelas"])
-        baris[5].write(p["no_whatsapp"])
+        baris[5].write(p["no_whatsapp"] or "-")
         with baris[6]:
             edit, hapus = st.columns(2)
-            if edit.button("Edit", key=f"ep_{p['id']}"):
+            if edit.button("Edit", key=f"ep_{p['id']}", icon=":material/edit:"):
                 st.session_state["mode_tambah"] = False
                 st.session_state["mode_edit_peminjam"] = p["id"]
                 st.rerun()
-            if hapus.button("Hapus", key=f"hp_{p['id']}"):
+            if hapus.button("Hapus", key=f"hp_{p['id']}", icon=":material/delete:"):
                 st.session_state["konfirmasi_peminjam"] = {"aksi": "hapus", "id": p["id"]}
                 st.rerun()
 
 def halaman_master_penulis():
     st.title("Data Penulis")
-    if st.button("Tambah Penulis", type="primary"):
+    if st.button("Tambah Penulis", type="primary", icon=":material/add:"):
         st.session_state["mode_tambah"] = "penulis"
         
     if st.session_state.get("mode_tambah") == "penulis":
         with st.form("f_penulis"):
             nama = st.text_input("Nama Penulis", placeholder="Cth: Andrea Hirata")
-            if st.form_submit_button("Tambah") and nama.strip():
+            if st.form_submit_button("Tambah", icon=":material/add:") and nama.strip():
                 try:
                     db.x("INSERT INTO penulis (nama_penulis) VALUES (?)", (nama.strip(),)); st.success("Penulis berhasil ditambahkan."); st.session_state["mode_tambah"] = False; st.rerun()
                 except Exception: st.error("Penulis sudah terdaftar.")
-        if st.button("Batal"): st.session_state["mode_tambah"] = False; st.rerun()
+        if st.button("Batal", icon=":material/close:"): st.session_state["mode_tambah"] = False; st.rerun()
         st.markdown("---")
 
     c1, c2 = st.columns([5, 2])
@@ -913,25 +1117,25 @@ def halaman_master_penulis():
         c1.write(p['nama_penulis'])
         with c2:
             col1, col2 = st.columns(2)
-            if col1.button("Edit", key=f"epn_{p['id']}"):
+            if col1.button("Edit", key=f"epn_{p['id']}", icon=":material/edit:"):
                 st.session_state["mode_tambah"] = "penulis"
-            if col2.button("Hapus", key=f"hpn_{p['id']}"):
+            if col2.button("Hapus", key=f"hpn_{p['id']}", icon=":material/delete:"):
                 if p['jml_buku'] > 0: st.error("Tidak dapat menghapus data karena masih terdapat buku terkait.")
                 else: db.x("DELETE FROM penulis WHERE id=?", (p["id"],)); st.success("Data penulis berhasil dihapus."); st.rerun()
 
 def halaman_master_penerbit():
     st.title("Data Penerbit")
-    if st.button("Tambah Penerbit", type="primary"):
+    if st.button("Tambah Penerbit", type="primary", icon=":material/add:"):
         st.session_state["mode_tambah"] = "penerbit"
         
     if st.session_state.get("mode_tambah") == "penerbit":
         with st.form("f_penerbit"):
             nama = st.text_input("Nama Penerbit", placeholder="Cth: Gramedia")
-            if st.form_submit_button("Tambah") and nama.strip():
+            if st.form_submit_button("Tambah", icon=":material/add:") and nama.strip():
                 try:
                     db.x("INSERT INTO penerbit (nama_penerbit) VALUES (?)", (nama.strip(),)); st.success("Penerbit berhasil ditambahkan."); st.session_state["mode_tambah"] = False; st.rerun()
                 except Exception: st.error("Penerbit sudah terdaftar.")
-        if st.button("Batal"): st.session_state["mode_tambah"] = False; st.rerun()
+        if st.button("Batal", icon=":material/close:"): st.session_state["mode_tambah"] = False; st.rerun()
         st.markdown("---")
 
     c1, c2 = st.columns([5, 2])
@@ -949,16 +1153,16 @@ def halaman_master_penerbit():
         c1.write(p['nama_penerbit'])
         with c2:
             col1, col2 = st.columns(2)
-            if col1.button("Edit", key=f"ept_{p['id']}"):
+            if col1.button("Edit", key=f"ept_{p['id']}", icon=":material/edit:"):
                 st.session_state["mode_tambah"] = "penerbit"
-            if col2.button("Hapus", key=f"hpt_{p['id']}"):
+            if col2.button("Hapus", key=f"hpt_{p['id']}", icon=":material/delete:"):
                 if p['jml_buku'] > 0: st.error("Tidak dapat menghapus data karena masih terdapat buku terkait.")
                 else: db.x("DELETE FROM penerbit WHERE id=?", (p["id"],)); st.success("Data penerbit berhasil dihapus."); st.rerun()
 
 # ================= DETAIL =================
 def tampilkan_detail_transaksi(id_trx):
     st.title("Detail Transaksi")
-    if st.button("Kembali"): tutup_detail(); st.rerun()
+    if st.button("Kembali", icon=":material/arrow_back:"): tutup_detail(); st.rerun()
     t = ambil_transaksi_lengkap(id_trx)
     if not t: st.error("Data tidak ditemukan."); return
 
@@ -969,6 +1173,8 @@ def tampilkan_detail_transaksi(id_trx):
         <h3 style="margin-top:0; color:#1e293b;">Informasi Transaksi</h3>
         <table style="width:100%; border-collapse:collapse;">
             <tr><td style="padding:5px 0; width:30%; color:#64748b;">Kode Transaksi</td><td><b>{t['kode_transaksi']}</b></td></tr>
+            <tr><td style="padding:5px 0; color:#64748b;">Kode Buku</td><td><b>{t['kode_buku']}</b></td></tr>
+            <tr><td style="padding:5px 0; color:#64748b;">Judul Buku</td><td><b>{t['judul']}</b></td></tr>
             <tr><td style="padding:5px 0; color:#64748b;">Status</td><td>{badge(t['status'])}</td></tr>
             <tr><td style="padding:5px 0; color:#64748b;">Tanggal Pinjam</td><td>{tgl(t['tanggal_pinjam'])}</td></tr>
             <tr><td style="padding:5px 0; color:#64748b;">Tenggat Pengembalian</td><td>{tgl(t['tanggal_tenggat'])}</td></tr>
@@ -984,18 +1190,37 @@ def tampilkan_detail_transaksi(id_trx):
     with c1:
         st.info(f"**Peminjam:** {t['nama_peminjam']}\n\n**NIM:** {t['nim']}\n\n**Kelas:** {t['kelas']}\n\n**Prodi:** {t['program_studi']}")
     with c2:
-        st.success(f"**Buku:** {t['judul']}\n\n**Kode:** {t['kode_buku']}\n\n**ISBN:** {t['isbn']}")
+        st.success(f"**ISBN:** {t['isbn']}")
+
+    st.markdown("---")
+    st.subheader("Riwayat WhatsApp Transaksi")
+    log_wa = db.q(
+        """SELECT jenis, no_tujuan, isi_pesan, status, waktu_kirim
+           FROM log_whatsapp WHERE id_transaksi=? AND status='TERKIRIM' ORDER BY id DESC""",
+        (id_trx,),
+    )
+    for log in log_wa:
+        with st.expander(
+            f"{log['jenis']} — Terkirim — {log['waktu_kirim']}"
+        ):
+            st.write(f"**Tujuan:** {log['no_tujuan']}")
+            st.text(log["isi_pesan"])
 
     st.markdown("---")
     st.subheader("Cetak Bukti")
-    if st.button("Tampilkan Nota (PDF)"):
+    if st.button("Tampilkan Bukti Transaksi", icon=":material/receipt_long:"):
         st.session_state["_cetak_bukti"] = t["id"]
 
     if st.session_state.get("_cetak_bukti") == t["id"]:
+        status_denda_nota = (
+            "LUNAS"
+            if t["status"] == "DIKEMBALIKAN"
+            else "Dihitung saat pengembalian"
+        )
         html_nota = f"""
         <div class='nota-box'>
             <div class='nota-header'>
-                <h2>PERPUSTAKAAN KAMPUS</h2>
+                <h2>SIPERNAS</h2>
                 <p>Jl. Pendidikan No. 1, Kota Kampus<br>Telp: (021) 1234567</p>
             </div>
             <table class='nota-table'>
@@ -1010,8 +1235,10 @@ def tampilkan_detail_transaksi(id_trx):
                 <tr><td>Kode Buku</td><td>: {t['kode_buku']}</td></tr>
                 <tr><td>Tgl Pinjam</td><td>: {tgl(t['tanggal_pinjam'])}</td></tr>
                 <tr><td>Batas Kembali</td><td>: {tgl(t['tanggal_tenggat'])}</td></tr>
+                <tr><td>Tgl Dikembalikan</td><td>: {tgl(t['tanggal_kembali'])}</td></tr>
                 <tr><td colspan="2"><hr style="border-top:1px dashed #000; margin:8px 0;"></td></tr>
-                <tr><td>Denda</td><td>: {rp(denda) if denda > 0 else 'Rp0'}</td></tr>
+                <tr><td>Denda</td><td>: {rp(denda) if denda > 0 else '-'}</td></tr>
+                <tr><td>Status Denda</td><td>: {status_denda_nota}</td></tr>
                 <tr><td>Status</td><td>: {t['status']}</td></tr>
             </table>
             <div class='nota-footer'>
@@ -1027,7 +1254,7 @@ def tampilkan_detail_transaksi(id_trx):
 
 def tampilkan_detail_peminjam(id_pem):
     st.title("Profil Anggota")
-    if st.button("Kembali"): tutup_detail(); st.rerun()
+    if st.button("Kembali", icon=":material/arrow_back:"): tutup_detail(); st.rerun()
     p = db.q("SELECT * FROM peminjam WHERE id=?", (id_pem,))[0]
     st.markdown(f"**NIM:** {p['nim']}  \n**Nama:** {p['nama']}  \n**Prodi:** {p['program_studi']}  \n**Jurusan:** {p['jurusan']}  \n**Kelas:** {p['kelas']}  \n**WA:** {p['no_whatsapp']}")
     st.subheader("Riwayat Transaksi")
@@ -1035,22 +1262,23 @@ def tampilkan_detail_peminjam(id_pem):
     if not rows: st.info("Belum ada riwayat.")
     for t in rows:
         c1, c2, c3 = st.columns([2, 4, 2])
-        if c1.button(t["kode_transaksi"], key=f"dp_t_{t['id']}"): buka_detail_trx(t["id"]); st.rerun()
+        if c1.button(t["kode_transaksi"], key=f"dp_t_{t['id']}", icon=":material/visibility:"): buka_detail_trx(t["id"]); st.rerun()
         c2.write(f"{t['judul']} — {tgl(t['tanggal_pinjam'])}")
         c3.markdown(badge(t["status"]), unsafe_allow_html=True)
 
 def tampilkan_detail_buku(id_buk):
     st.title("Detail Buku")
-    if st.button("Kembali"): tutup_detail(); st.rerun()
+    if st.button("Kembali", icon=":material/arrow_back:"): tutup_detail(); st.rerun()
     b = db.q("SELECT b.*, pn.nama_penulis, pb.nama_penerbit FROM buku b JOIN penulis pn ON pn.id=b.id_penulis JOIN penerbit pb ON pb.id=b.id_penerbit WHERE b.id=?", (id_buk,))[0]
-    st.markdown(f"**{b['kode_buku']} — {b['judul']}**  \nISBN: {b['isbn']} | Penulis: {b['nama_penulis']} | Penerbit: {b['nama_penerbit']} | {b['tahun_terbit']}")
+    tahun_terbit = b["tahun_terbit"] or "Tidak tercantum"
+    st.markdown(f"**{b['kode_buku']} — {b['judul']}**  \nISBN: {b['isbn']} | Penulis: {b['nama_penulis']} | Penerbit: {b['nama_penerbit']} | Tahun terbit: {tahun_terbit}")
     st.markdown(f"**Stok:** {b['stok_tersedia']} tersedia / {b['stok_total']} total")
     st.subheader("Riwayat Peminjaman")
     rows = db.q("SELECT t.*, p.nama AS nama_peminjam, p.nim FROM transaksi t JOIN peminjam p ON p.id=t.id_peminjam WHERE t.id_buku=? ORDER BY t.id DESC", (id_buk,))
     if not rows: st.info("Belum pernah dipinjam."); return
     for t in rows:
         c1, c2, c3 = st.columns([2, 4, 2])
-        if c1.button(t["kode_transaksi"], key=f"db_t_{t['id']}"): buka_detail_trx(t["id"]); st.rerun()
+        if c1.button(t["kode_transaksi"], key=f"db_t_{t['id']}", icon=":material/visibility:"): buka_detail_trx(t["id"]); st.rerun()
         c2.write(f"{t['nama_peminjam']} — {tgl(t['tanggal_pinjam'])}")
         c3.markdown(badge(t["status"]), unsafe_allow_html=True)
 

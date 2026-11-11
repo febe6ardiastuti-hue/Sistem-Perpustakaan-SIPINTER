@@ -1,24 +1,51 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
+:root {
+    --app-bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-soft: #f0f3f6;
+    --ink: #263445;
+    --muted: #687789;
+    --line: #e1e6ec;
+    --blue: #365a7a;
+    --blue-hover: #2d4d69;
+    --teal: #5b827e;
+    --teal-soft: #edf4f2;
+    --shadow: 0 2px 8px rgba(38, 52, 69, .05);
+}
+
 html, body, [class*="css"] {
     font-family: 'Inter', sans-serif;
 }
 
-/* Styling Sidebar */
+[data-testid="stAppViewContainer"] {
+    background: var(--app-bg);
+    color: var(--ink);
+}
+[data-testid="stHeader"] {
+    background: rgba(246, 247, 249, .96);
+}
+[data-testid="stAppViewContainer"] h1,
+[data-testid="stAppViewContainer"] h2,
+[data-testid="stAppViewContainer"] h3 {
+    color: #2e465d;
+}
+
 [data-testid="stSidebar"] {
-    background-color: #ffffff;
-    border-right: 1px solid #e5e7eb;
+    background:
+        radial-gradient(ellipse at 100% 10%, rgba(181, 190, 224, .20), transparent 42%),
+        linear-gradient(180deg, #f3f6fb 0%, #f6f7fa 55%, #f1f3f8 100%);
+    border-right: 1px solid var(--line);
 }
 [data-testid="stSidebarNav"] {
     display: none;
 }
 
-/* Logo */
 .logo-container {
-    padding: 10px 20px 30px 20px;
+    padding: 10px 20px 30px;
     font-size: 24px;
     font-weight: 800;
-    color: #1e3a8a;
+    color: var(--blue);
     display: flex;
     align-items: center;
     gap: 8px;
@@ -27,11 +54,10 @@ html, body, [class*="css"] {
     font-size: 28px;
 }
 
-/* Kategori Menu */
 .menu-kategori {
-    font-size: 11px;
+    font-size: 13px;
     font-weight: 600;
-    color: #64748b;
+    color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 1px;
     margin-top: 20px;
@@ -39,42 +65,166 @@ html, body, [class*="css"] {
     padding-left: 16px;
 }
 
-/* Tombol Menu Custom */
 .stButton > button {
     width: 100%;
-    background-color: transparent !important;
-    border: none !important;
+    background: transparent !important;
+    border: 1px solid transparent !important;
     text-align: left !important;
     padding: 9px 16px !important;
-    color: #334155 !important;
+    color: var(--ink) !important;
     font-size: 14px !important;
-    border-radius: 5px !important;
-    transition: all 0.2s;
+    border-radius: 7px !important;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
     display: flex;
     justify-content: flex-start;
 }
+[data-testid="stSidebar"] .stButton > button {
+    font-size: 16px !important;
+}
 .stButton > button:hover {
-    background-color: #f1f5f9 !important;
+    background: var(--surface-soft) !important;
+    border-color: var(--line) !important;
+    color: var(--blue) !important;
 }
-/* Menu Aktif */
-.menu-active > button {
-    background-color: #eaf0f7 !important;
-    border-left: 4px solid #1e3a8a !important;
-    color: #1e3a8a !important;
+[data-testid="stSidebar"] div.stButton > button[kind="secondary"] {
+    background: transparent !important;
+    border-color: transparent !important;
+    color: #536274 !important;
+}
+[data-testid="stSidebar"] div.stButton > button[kind="secondary"]:hover {
+    background: rgba(255, 255, 255, .62) !important;
+    border-color: rgba(211, 218, 226, .65) !important;
+    color: #354f69 !important;
+}
+[data-testid="stSidebar"] div.stButton > button[kind="primary"] {
+    background: rgba(255, 255, 255, .82) !important;
+    border-color: rgba(255, 255, 255, .92) !important;
+    border-left: 3px solid #8a82b5 !important;
+    color: #344b63 !important;
     font-weight: 600 !important;
+    box-shadow: 0 1px 3px rgba(38, 52, 69, .05);
+}
+[data-testid="stSidebar"] div.stButton > button[kind="primary"]:hover {
+    background: #ffffff !important;
+    border-color: #ffffff !important;
+    border-left-color: #8a82b5 !important;
+    color: #344b63 !important;
+}
+[data-testid="stSidebar"] div.stButton > button [data-testid="stIconMaterial"] {
+    color: #78889a;
+}
+[data-testid="stSidebar"] div.stButton > button[kind="primary"] [data-testid="stIconMaterial"] {
+    color: #756d9e;
 }
 
-/* Kartu Dashboard */
-.kartu{border-radius:8px;padding:16px 18px;background:#fff;
-border:1px solid #e2e8f0;border-left:4px solid #1e3a8a;box-shadow:0 1px 3px rgba(15,23,42,.05);margin-bottom:10px}
-.kartu .angka{font-size:26px;font-weight:700;color:#111827}
-.kartu .label{font-size:13px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px}
+div.stButton > button[kind="primary"] {
+    background: var(--blue) !important;
+    border-color: var(--blue) !important;
+    color: #ffffff !important;
+    border-radius: 8px !important;
+    font-weight: 600;
+}
+div.stButton > button[kind="primary"]:hover {
+    background: var(--blue-hover) !important;
+    border-color: var(--blue-hover) !important;
+    color: #ffffff !important;
+}
+div.stButton > button[kind="secondary"] {
+    background: var(--surface) !important;
+    border-color: var(--line) !important;
+}
+div.stButton > button[kind="secondary"]:hover {
+    background: var(--teal-soft) !important;
+    border-color: #c9d9d5 !important;
+}
 
-/* Kotak Bukti */
-.bukti-box{border:1px solid #cbd5e1;border-radius:8px;padding:20px;background:#f8fafc}
-.bukti-box h3{margin:0 0 10px 0;color:#1e3a8a}
-.bukti-box table{width:100%;font-size:14px}
-.bukti-box td{padding:4px 6px}
-.bukti-box td:first-child{width:35%;color:#6b7280}
+.kartu {
+    border-radius: 9px;
+    padding: 16px 18px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--blue);
+    box-shadow: var(--shadow);
+    margin-bottom: 10px;
+}
+.kartu:nth-child(odd) {
+    border-left-color: var(--teal);
+}
+.kartu .angka {
+    font-size: 26px;
+    font-weight: 700;
+    color: #2e465d;
+}
+.kartu .label {
+    font-size: 13px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .5px;
+}
 
-@media print{.no-print{display:none!important}.bukti-box{border:1px solid #000;background:#fff}}
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stDateInput"] input,
+[data-testid="stTextArea"] textarea {
+    background: var(--surface);
+    border-color: #d3dae2;
+    border-radius: 7px;
+}
+[data-testid="stTextInput"] input:focus,
+[data-testid="stNumberInput"] input:focus,
+[data-testid="stDateInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {
+    border-color: var(--teal);
+    box-shadow: 0 0 0 1px rgba(91, 130, 126, .18);
+}
+[data-baseweb="select"] > div {
+    background: var(--surface);
+    border-color: #d3dae2;
+    border-radius: 7px;
+}
+[data-testid="stExpander"] {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    box-shadow: var(--shadow);
+}
+[data-testid="stMetric"] {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 12px 16px;
+    box-shadow: var(--shadow);
+}
+[data-testid="stMetricLabel"] {
+    color: var(--muted);
+}
+[data-testid="stMetricValue"] {
+    color: var(--blue);
+}
+
+.bukti-box {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 20px;
+    background: var(--surface);
+}
+.bukti-box h3 {
+    margin: 0 0 10px;
+    color: var(--blue);
+}
+.bukti-box table {
+    width: 100%;
+    font-size: 14px;
+}
+.bukti-box td {
+    padding: 4px 6px;
+}
+.bukti-box td:first-child {
+    width: 35%;
+    color: var(--muted);
+}
+
+@media print {
+    .no-print { display: none !important; }
+    .bukti-box { border: 1px solid #000; background: #fff; }
+}
